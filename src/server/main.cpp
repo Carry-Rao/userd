@@ -1,0 +1,131 @@
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <message.hpp>
+#include <message_queue.hpp>
+#include <service.hpp>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+
+int main() {
+    std::map<std::string, Service> services;
+    MessageQueue<Message> mq;
+
+    auto config_path =
+        std::filesystem::path(getenv("HOME")) / ".config" / "userd";
+    std::filesystem::create_directories(config_path);
+    for (const auto &entry :
+         std::filesystem::recursive_directory_iterator(config_path)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".service") {
+            std::map<std::string, std::string> config;
+            std::ifstream config_is(entry.path());
+            std::string line;
+            while (std::getline(config_is, line)) {
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                size_t pos = line.find('=');
+                if (pos != std::string::npos) {
+                    config[line.substr(0, pos)] = line.substr(pos + 1);
+                } else {
+                    throw std::invalid_argument("Invalid config format");
+                }
+            }
+            services.emplace(config["name"],
+                             Service(config["restart_policy"], config));
+        }
+    }
+    {
+        if (!std::filesystem::exists(config_path / "enable")) {
+            std::ofstream enable_os(config_path / "enable");
+        }
+        std::ifstream enable_is(config_path / "enable");
+        std::string line;
+        while (std::getline(enable_is, line)) {
+            if (!line.empty() && line[0] != '#') {
+                mq.send(Message{"start", line});
+            }
+        }
+    }
+    std::jthread t([&mq]() {
+        auto socket_path = std::filesystem::path("/run/user") /
+                           std::to_string(getuid()) / "userd.socket";
+        int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        strcpy(addr.sun_path, socket_path.c_str());
+        unlink(socket_path.c_str());
+        bind(sfd, (sockaddr *)&addr, sizeof(addr));
+        listen(sfd, 1);
+        while (true) {
+            int cfd = accept(sfd, nullptr, nullptr);
+            char buf[1024];
+            size_t len = read(cfd, buf, sizeof(buf));
+            if (buf[0] != 'o') {
+                write(cfd, "eInvalid message format\0", 25);
+                continue;
+            }
+            std::string_view str(buf + 1, len - 1);
+            size_t pos = str.find('\04');
+            if (pos != std::string::npos) {
+                str = str.substr(0, pos);
+            }
+            pos = str.find(' ');
+            if (pos != std::string::npos) {
+                mq.send(Message{cfd, std::string(str.substr(0, pos)),
+                                std::string(str.substr(pos + 1))});
+            } else {
+                write(cfd, "eInvalid message format\0", 25);
+            }
+        }
+    });
+    while (true) {
+        auto msg = mq.receive();
+        auto it = services.find(msg.service);
+        if (it != services.end()) {
+            if (msg.opt == "start") {
+                if (it->second.env_from_client) {
+                    msg << "ve";
+                    std::string env;
+                    msg >> env;
+                    if (env[0] != 'a') {
+                        msg << "eInvalid environment format";
+                        continue;
+                    }
+                    it->second.setenv(env.substr(1));
+                }
+                if (it->second.workdir_from_client) {
+                    msg << "vw";
+                    std::string workdir;
+                    msg >> workdir;
+                    if (workdir[0] != 'a') {
+                        msg << "eInvalid workdir format";
+                        continue;
+                    }
+                    it->second.setworkdir(workdir.substr(1));
+                }
+                msg << "oStarting";
+                it->second.start(mq);
+            } else if (msg.opt == "stop") {
+                msg << "oStopping";
+                it->second.stop();
+            } else if (msg.opt == "restart") {
+                msg << "oRestarting";
+                it->second.restart(mq);
+            } else {
+                msg << "eInvalid option.";
+            }
+        } else if (msg.opt == "exit") {
+            msg << "Exiting...";
+            break;
+        } else {
+            msg << "eService not found";
+        }
+    }
+    return 0;
+}
