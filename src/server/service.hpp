@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <map>
@@ -8,12 +10,11 @@
 #include <signal.h>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
-#include <cstdlib>
-#include <sys/stat.h>
 
 enum class Status { Stopped, Running, Failed, Killed, Unknown };
 
@@ -35,45 +36,29 @@ public:
         if (pos != std::string::npos) {
             try {
                 _max_restart_time = std::stoi(policy.substr(pos + 1));
-            } catch (const std::invalid_argument&) {
-                throw std::invalid_argument("Invalid restart time format");
-            } catch (const std::out_of_range&) {
-                throw std::out_of_range("Restart time out of range");
+            } catch (...) {
+                throw;
             }
             policy = policy.substr(0, pos);
         } else {
             _max_restart_time = -1;
         }
-        if (policy == "no") {
-            _policy = RP::No;
-        } else if (policy == "always") {
-            _policy = RP::Always;
-        } else if (policy == "unless-stopped") {
-            _policy = RP::UnlessStopped;
-        } else if (policy == "on-failure") {
-            _policy = RP::OnFailure;
-        } else {
-            throw std::invalid_argument("Invalid restart policy");
-        }
+        if (policy == "no") _policy = RP::No;
+        else if (policy == "always") _policy = RP::Always;
+        else if (policy == "unless-stopped") _policy = RP::UnlessStopped;
+        else if (policy == "on-failure") _policy = RP::OnFailure;
+        else throw std::invalid_argument("Invalid restart policy");
     }
 
     bool need(Status status) {
-        if (_policy == RP::No) {
-            return false;
-        }
-        if (_restart_time >= _max_restart_time) {
-            return false;
-        }
+        if (_policy == RP::No) return false;
+        if (_restart_time >= _max_restart_time) return false;
         _restart_time++;
         switch (_policy) {
-        case RP::Always:
-            return true;
-        case RP::OnFailure:
-            return status == Status::Failed;
-        case RP::UnlessStopped:
-            return status != Status::Stopped;
-        default:
-            return false;
+        case RP::Always: return true;
+        case RP::OnFailure: return status == Status::Failed;
+        case RP::UnlessStopped: return status != Status::Stopped;
+        default: return false;
         }
     }
 };
@@ -81,10 +66,10 @@ public:
 struct Service {
 private:
     std::string name;
-    Status _status = Status::Stopped;
+    std::atomic<Status> _status{Status::Stopped};
+    std::atomic<bool> _stopping{false};
     RestartPolicy _restart_policy;
-    std::jthread _monitor;
-
+    MessageQueue<Message>& _queue;
     pid_t _pid = -1;
     char** _cmd = nullptr;
     char** _env = nullptr;
@@ -97,22 +82,26 @@ public:
     bool env_from_client = false;
     bool workdir_from_client = false;
 
-    Service(std::string, std::map<std::string, std::string>);
+    Service(std::string, std::map<std::string, std::string>, MessageQueue<Message>&);
     Service(const Service &) = delete;
     Service &operator=(const Service &) = delete;
     Service(Service &&);
     Service &operator=(Service &&);
     ~Service();
 
-    void start(MessageQueue<Message> &queue);
+    pid_t start();
     void stop();
-    void restart(MessageQueue<Message> &queue);
+    void restart();
     void setenv(std::string);
     void setworkdir(std::string);
+    void handle_exit(int status);
+    Status status() const { return _status.load(); }
+    const std::string& service_name() const { return name; }
+    pid_t pid() const { return _pid; }
 };
 
-Service::Service(std::string restart_policy, std::map<std::string, std::string> options)
-    : _restart_policy(restart_policy) {
+Service::Service(std::string restart_policy, std::map<std::string, std::string> options, MessageQueue<Message>& queue)
+    : _restart_policy(restart_policy), _queue(queue) {
     auto it = options.find("name");
     if (it != options.end()) {
         name = it->second;
@@ -179,10 +168,11 @@ Service::Service(std::string restart_policy, std::map<std::string, std::string> 
 }
 
 Service::Service(Service &&other)
-    : name(std::move(other.name)), _status(other._status),
-      _restart_policy(other._restart_policy), _monitor(std::move(other._monitor)),
-      _pid(other._pid), _cmd(other._cmd), _env(other._env), _workdir(other._workdir),
-      env_from_client(other.env_from_client), workdir_from_client(other.workdir_from_client) {
+    : name(std::move(other.name)), _status(other._status.load()),
+      _stopping(other._stopping.load()), _restart_policy(other._restart_policy),
+      _queue(other._queue), _pid(other._pid), _cmd(other._cmd), _env(other._env),
+      _workdir(other._workdir), env_from_client(other.env_from_client),
+      workdir_from_client(other.workdir_from_client) {
     other._cmd = nullptr;
     other._env = nullptr;
     other._workdir = nullptr;
@@ -195,9 +185,9 @@ Service &Service::operator=(Service &&other) {
         delete[] _workdir;
 
         name = std::move(other.name);
-        _status = other._status;
+        _status.store(other._status.load());
+        _stopping.store(other._stopping.load());
         _restart_policy = other._restart_policy;
-        _monitor = std::move(other._monitor);
         _pid = other._pid;
         _cmd = other._cmd;
         _env = other._env;
@@ -235,14 +225,13 @@ Service::~Service() {
     freeCmd();
     freeEnv();
     delete[] _workdir;
-    if (_monitor.joinable()) {
-        _monitor.join();
-    }
 }
 
-void Service::start(MessageQueue<Message> &queue) {
-    pid_t pid = fork();
-    if (pid == 0) {
+pid_t Service::start() {
+    _stopping = false;
+    _status = Status::Running;
+    _pid = fork();
+    if (_pid == 0) {
         int null_fd = open("/dev/null", O_RDONLY);
         dup2(null_fd, 0);
         close(null_fd);
@@ -261,35 +250,37 @@ void Service::start(MessageQueue<Message> &queue) {
         execve(_cmd[0], _cmd, _env);
         exit(1);
     }
-    _pid = pid;
-    _status = Status::Running;
+    return _pid;
+}
 
-    _monitor = std::jthread([&queue, this]() {
-        int status;
-        waitpid(_pid, &status, 0);
-        if (WIFSIGNALED(status)) {
-            _status = Status::Killed;
-        } else if (WIFEXITED(status)) {
-            _status = WEXITSTATUS(status) == 0 ? Status::Stopped : Status::Failed;
-        } else {
-            _status = Status::Unknown;
-        }
-        if (_restart_policy.need(_status)) {
-            queue.send(Message{"start", name});
-        }
-    });
+void Service::handle_exit(int status) {
+    if (_stopping.exchange(false)) {
+        _status = Status::Stopped;
+        return;
+    }
+    if (WIFSIGNALED(status)) {
+        _status = Status::Killed;
+    } else if (WIFEXITED(status)) {
+        _status = WEXITSTATUS(status) == 0 ? Status::Stopped : Status::Failed;
+    } else {
+        _status = Status::Unknown;
+    }
+    if (_restart_policy.need(_status)) {
+        _queue.send(Message{"start", name});
+    }
 }
 
 void Service::stop() {
+    _stopping = true;
     _status = Status::Stopped;
     if (_pid > 0 && kill(_pid, 0) == 0) {
         kill(_pid, SIGTERM);
     }
 }
 
-void Service::restart(MessageQueue<Message> &queue) {
+void Service::restart() {
     stop();
-    start(queue);
+    start();
 }
 
 void Service::setenv(std::string env) {

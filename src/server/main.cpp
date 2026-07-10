@@ -4,16 +4,42 @@
 #include <map>
 #include <message.hpp>
 #include <message_queue.hpp>
+#include <mutex>
 #include <service.hpp>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
 
+void waiter(std::stop_token st, std::map<std::string, Service>& services, std::mutex& mtx) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);
+
+    while (!st.stop_requested()) {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (auto& [n, s] : services) {
+                if (s.pid() == pid) {
+                    s.handle_exit(status);
+                    break;
+                }
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
 int main() {
     std::map<std::string, Service> services;
+    std::mutex services_mtx;
     MessageQueue<Message> mq;
 
     auto config_path =
@@ -37,7 +63,7 @@ int main() {
                 }
             }
             services.emplace(config["name"],
-                             Service(config["restart_policy"], config));
+                             Service(config["restart_policy"], config, mq));
         }
     }
     {
@@ -52,6 +78,10 @@ int main() {
             }
         }
     }
+
+    std::stop_source ss;
+    std::jthread waiter_thread(waiter, ss.get_token(), std::ref(services), std::ref(services_mtx));
+
     std::jthread t([&mq]() {
         auto socket_path = std::filesystem::path("/run/user") /
                            std::to_string(getuid()) / "userd.socket";
@@ -110,13 +140,13 @@ int main() {
                     it->second.setworkdir(workdir.substr(1));
                 }
                 msg << "oStarting";
-                it->second.start(mq);
+                it->second.start();
             } else if (msg.opt == "stop") {
                 msg << "oStopping";
                 it->second.stop();
             } else if (msg.opt == "restart") {
                 msg << "oRestarting";
-                it->second.restart(mq);
+                it->second.restart();
             } else {
                 msg << "eInvalid option.";
             }
@@ -127,5 +157,6 @@ int main() {
             msg << "eService not found";
         }
     }
+    ss.request_stop();
     return 0;
 }
