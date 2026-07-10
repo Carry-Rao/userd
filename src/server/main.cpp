@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <message.hpp>
 #include <set>
@@ -148,6 +149,18 @@ int main() {
                 }
             }
             msg << "oReloaded";
+            continue;
+        }
+        if (msg.opt == "logs") {
+            auto home = getenv("HOME");
+            auto log_path = std::filesystem::path(home) / ".cache" / "userd" / (msg.service + ".log");
+            std::ifstream log_is(log_path);
+            if (log_is) {
+                std::string content((std::istreambuf_iterator<char>(log_is)), std::istreambuf_iterator<char>());
+                msg << ("o" + content);
+            } else {
+                msg << "eLog not found";
+            }
             continue;
         }
         if (msg.opt == "status") {
