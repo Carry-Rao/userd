@@ -150,6 +150,32 @@ int main() {
             msg << "oReloaded";
             continue;
         }
+        if (msg.opt == "status") {
+            if (msg.service.empty()) {
+                std::string report;
+                for (auto& [n, s] : services) {
+                    report += n + ": " + to_string(s.status());
+                    if (s.status() == Status::Running) {
+                        report += " (pid " + std::to_string(s.pid()) + ")";
+                    }
+                    report += "\n";
+                }
+                if (report.empty()) report = "No services";
+                msg << ("o" + report);
+            } else {
+                auto si = services.find(msg.service);
+                if (si != services.end()) {
+                    std::string report = si->first + ": " + to_string(si->second.status());
+                    if (si->second.status() == Status::Running) {
+                        report += " (pid " + std::to_string(si->second.pid()) + ")";
+                    }
+                    msg << ("o" + report);
+                } else {
+                    msg << "eService not found";
+                }
+            }
+            continue;
+        }
         auto it = services.find(msg.service);
         if (it != services.end()) {
             if (msg.opt == "start") {

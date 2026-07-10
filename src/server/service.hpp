@@ -18,6 +18,17 @@
 
 enum class Status { Stopped, Running, Failed, Killed, Unknown };
 
+inline const char* to_string(Status s) {
+    switch (s) {
+    case Status::Stopped: return "stopped";
+    case Status::Running: return "running";
+    case Status::Failed: return "failed";
+    case Status::Killed: return "killed";
+    case Status::Unknown: return "unknown";
+    }
+    return "unknown";
+}
+
 struct RestartPolicy {
 private:
     enum class RP { No, Always, UnlessStopped, OnFailure };
