@@ -3,6 +3,7 @@
 #include <iostream>
 #include <map>
 #include <message.hpp>
+#include <set>
 #include <message_queue.hpp>
 #include <mutex>
 #include <service.hpp>
@@ -13,6 +14,20 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
+
+std::map<std::string, std::string> parse_config(const std::filesystem::path& path) {
+    std::map<std::string, std::string> config;
+    std::ifstream is(path);
+    std::string line;
+    while (std::getline(is, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        size_t pos = line.find('=');
+        if (pos != std::string::npos) {
+            config[line.substr(0, pos)] = line.substr(pos + 1);
+        }
+    }
+    return config;
+}
 
 void waiter(std::stop_token st, std::map<std::string, Service>& services, std::mutex& mtx) {
     sigset_t set;
@@ -48,20 +63,7 @@ int main() {
     for (const auto &entry :
          std::filesystem::recursive_directory_iterator(config_path)) {
         if (entry.is_regular_file() && entry.path().extension() == ".service") {
-            std::map<std::string, std::string> config;
-            std::ifstream config_is(entry.path());
-            std::string line;
-            while (std::getline(config_is, line)) {
-                if (line.empty() || line[0] == '#') {
-                    continue;
-                }
-                size_t pos = line.find('=');
-                if (pos != std::string::npos) {
-                    config[line.substr(0, pos)] = line.substr(pos + 1);
-                } else {
-                    throw std::invalid_argument("Invalid config format");
-                }
-            }
+            auto config = parse_config(entry.path());
             services.emplace(config["name"],
                              Service(config["restart_policy"], config, mq));
         }
@@ -116,6 +118,38 @@ int main() {
     });
     while (true) {
         auto msg = mq.receive();
+        if (msg.opt == "exit") {
+            msg << "Exiting...";
+            break;
+        }
+        if (msg.opt == "reload") {
+            std::lock_guard<std::mutex> lock(services_mtx);
+            std::set<std::string> seen;
+            for (const auto &entry :
+                 std::filesystem::recursive_directory_iterator(config_path)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".service") continue;
+                auto config = parse_config(entry.path());
+                auto name = config["name"];
+                seen.insert(name);
+                auto si = services.find(name);
+                if (si != services.end()) {
+                    if (si->second.status() == Status::Running) continue;
+                    si->second = Service(config["restart_policy"], config, mq);
+                } else {
+                    services.emplace(name, Service(config["restart_policy"], config, mq));
+                }
+            }
+            for (auto si = services.begin(); si != services.end(); ) {
+                if (seen.find(si->first) == seen.end()) {
+                    si->second.stop();
+                    si = services.erase(si);
+                } else {
+                    ++si;
+                }
+            }
+            msg << "oReloaded";
+            continue;
+        }
         auto it = services.find(msg.service);
         if (it != services.end()) {
             if (msg.opt == "start") {
@@ -150,9 +184,6 @@ int main() {
             } else {
                 msg << "eInvalid option.";
             }
-        } else if (msg.opt == "exit") {
-            msg << "Exiting...";
-            break;
         } else {
             msg << "eService not found";
         }
