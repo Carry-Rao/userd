@@ -4,7 +4,6 @@
 #include <iterator>
 #include <map>
 #include <message.hpp>
-#include <set>
 #include <message_queue.hpp>
 #include <mutex>
 #include <service.hpp>
@@ -125,27 +124,17 @@ int main() {
         }
         if (msg.opt == "reload") {
             std::lock_guard<std::mutex> lock(services_mtx);
-            std::set<std::string> seen;
             for (const auto &entry :
                  std::filesystem::recursive_directory_iterator(config_path)) {
                 if (!entry.is_regular_file() || entry.path().extension() != ".service") continue;
                 auto config = parse_config(entry.path());
                 auto name = config["name"];
-                seen.insert(name);
                 auto si = services.find(name);
                 if (si != services.end()) {
                     if (si->second.status() == Status::Running) continue;
                     si->second = Service(config["restart_policy"], config, mq);
                 } else {
                     services.emplace(name, Service(config["restart_policy"], config, mq));
-                }
-            }
-            for (auto si = services.begin(); si != services.end(); ) {
-                if (seen.find(si->first) == seen.end()) {
-                    si->second.stop();
-                    si = services.erase(si);
-                } else {
-                    ++si;
                 }
             }
             msg << "oReloaded";
